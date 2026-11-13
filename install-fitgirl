@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""Headless, muted FitGirl repack installer for Lutris.
+
+usage: install-fitgirl "<repack folder>" [--games-dir DIR | --dest DIR] [--name NAME]
+                       [--exe PATH] [--proton DIR] [--no-lutris] [--skip-source-check]
+
+What it does:
+  1. checks the repack's .bin files against MD5/fitgirl-bins.md5
+  2. runs setup.exe /SILENT on a hidden gamescope display (no window, no music),
+     with all installer checkboxes left at their defaults
+  3. closes the post-install verifier window and verifies the files natively
+  4. adds the game to Lutris
+
+Why the env cleanup matters: agent/sandbox shells export
+NoDefaultCurrentDirectoryInExePath=1, which Wine honours and which stops
+unarc.dll from finding its helper decompressors -> crashes / CRC errors.
+"""
+import argparse, hashlib, os, re, signal, sqlite3, subprocess, sys, time
+from pathlib import Path
+
+HOME = Path.home()
+GAMES_DIR = Path(os.environ.get("FITGIRL_GAMES_DIR", HOME / "Games"))
+PREFIX_DIR = Path(os.environ.get("FITGIRL_PREFIX_DIR", HOME / "Games/lutris-prefixes"))
+PROTON_DIRS = [HOME / ".local/share/Steam/compatibilitytools.d", HOME / ".local/share/lutris/runners/wine"]
+LUTRIS = HOME / ".local/share/lutris"
+# post-install programs that block a silent install by waiting for clicks
+POSTINSTALL_PAT = r"(_Redist.(QuickSFV|dxwebsetup|vc_redist)|vc_redist\.x(86|64)\.exe|dxwsetup\.exe)"
+EXE_SKIP = re.compile(r"unins|crash|redist|quicksfv|dxwebsetup|setup|launcher_helper|easyanticheat|vc_", re.I)
+
+
+def find_proton():
+    """Newest installed GE-Proton, or 'GE-Proton' to let umu download the latest."""
+    key = lambda p: [int(n) for n in re.findall(r"\d+", p.name)]
+    found = [p for d in PROTON_DIRS if d.is_dir() for p in d.glob("GE-Proton*") if (p / "proton").is_file()]
+    return str(max(found, key=key)) if found else "GE-Proton"
+
+
+def say(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def md5(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        while chunk := f.read(8 << 20):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def check_md5_list(listfile, base, allow_missing):
+    """listfile lines: '<md5> *..\\rel\\path' relative to listfile's folder's parent."""
+    bad, missing, ok = [], [], 0
+    for line in Path(listfile).read_text(errors="replace").splitlines():
+        m = re.match(r"^([0-9a-fA-F]{32}) \*(.+)$", line.strip())
+        if not m:
+            continue
+        rel = m.group(2).replace("\\", "/")
+        p = (Path(base) / rel).resolve()
+        if not p.is_file():
+            missing.append(rel)
+        elif md5(p) != m.group(1).lower():
+            bad.append(rel)
+        else:
+            ok += 1
+    if not allow_missing:
+        bad += missing
+    return ok, bad, missing
+
+
+def windows(disp):
+    """Mapped, named windows on an X display: [(id, name)]."""
+    from Xlib import display
+    out = []
+    try:
+        d = display.Display(disp)
+    except Exception:
+        return out
+
+    def walk(w):
+        try:
+            name = w.get_wm_name()
+            if name and name != "Default IME" and w.get_attributes().map_state == 2:
+                out.append((w.id, name))
+            for c in w.query_tree().children:
+                walk(c)
+        except Exception:
+            pass
+
+    walk(d.screen().root)
+    d.close()
+    return out
+
+
+def screenshot(disp, wid, out):
+    subprocess.run(["import", "-display", disp, "-window", hex(wid), str(out)],
+                   timeout=30, cwd="/tmp", stderr=subprocess.DEVNULL)
+
+
+def pids(pattern):
+    r = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True)
+    return [int(p) for p in r.stdout.split() if int(p) != os.getpid()]
+
+
+def display_of(pid):
+    try:
+        env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+        return next(e[8:].decode() for e in env if e.startswith(b"DISPLAY="))
+    except Exception:
+        return None
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("repack")
+    ap.add_argument("--games-dir", default=GAMES_DIR, help=f"folder that holds your games (default: {GAMES_DIR}, or $FITGIRL_GAMES_DIR)")
+    ap.add_argument("--dest", help="exact install folder (default: <games-dir>/<name>)")
+    ap.add_argument("--proton", help="GE-Proton folder (default: newest installed, else umu downloads one)")
+    ap.add_argument("--name", help="game name for Lutris (default: from folder name)")
+    ap.add_argument("--exe", help="game executable, relative to the install folder (default: guess)")
+    ap.add_argument("--prefix", help=f"Wine prefix (default: {PREFIX_DIR}/<slug>, or $FITGIRL_PREFIX_DIR/<slug>)")
+    ap.add_argument("--no-lutris", action="store_true", help="don't add a Lutris entry")
+    ap.add_argument("--skip-source-check", action="store_true", help="skip MD5 check of the .bin files")
+    a = ap.parse_args()
+
+    repack = Path(a.repack).resolve()
+    setup = repack / "setup.exe"
+    if not setup.is_file():
+        sys.exit(f"no setup.exe in {repack}")
+    name = a.name or re.sub(r"\s*\[.*?\]\s*$", "", repack.name).strip()
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    dest = Path(a.dest).resolve() if a.dest else Path(a.games_dir).resolve() / name
+    proton = a.proton or find_proton()
+    prefix = Path(a.prefix).resolve() if a.prefix else PREFIX_DIR / slug
+    logdir = LUTRIS / "install-logs" / slug
+    logdir.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and any(dest.iterdir()):
+        sys.exit(f"destination is not empty: {dest}")
+    say(f"game: {name}\n           dest: {dest}\n           prefix: {prefix}\n           proton: {proton}\n           logs: {logdir}")
+
+    # 1. source check
+    binlist = repack / "MD5/fitgirl-bins.md5"
+    if a.skip_source_check or not binlist.is_file():
+        say("source check skipped")
+    else:
+        say("checking repack .bin files...")
+        ok, bad, missing = check_md5_list(binlist, binlist.parent, allow_missing=True)
+        if bad:
+            sys.exit(f"corrupt repack files: {bad}")
+        say(f"source OK ({ok} files" + (f", {len(missing)} optional not downloaded)" if missing else ")"))
+
+    # 2. headless silent install
+    env = dict(os.environ)
+    for k in ("NoDefaultCurrentDirectoryInExePath", "LD_LIBRARY_PATH", "LD_PRELOAD"):
+        env.pop(k, None)
+    env.update(
+        WINEPREFIX=str(prefix), PROTONPATH=proton, GAMEID="umu-default",
+        PRESSURE_VESSEL_FILESYSTEMS_RW=f"{dest.parent}:{repack}",
+        # no .NET/HTML prompts, no audio driver (mutes installer music), no browser pop-up
+        WINEDLLOVERRIDES="mscoree,mshtml=;winepulse.drv,winealsa.drv=;winebrowser.exe=",
+    )
+    winpath = lambda p: "Z:" + str(p).replace("/", "\\")
+    cmd = ["gamescope", "--backend", "headless", "-W", "1280", "-H", "800", "--",
+           "umu-run", str(setup), "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-",
+           f"/DIR={winpath(dest)}", f"/LOG={winpath(logdir / 'setup.log')}"]
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    say("starting installer (hidden display, muted)...")
+    with open(logdir / "wine.log", "w") as out:
+        proc = subprocess.Popen(cmd, env=env, cwd=repack, stdout=out, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+
+    def stop():
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    signal.signal(signal.SIGINT, lambda *_: (stop(), sys.exit("interrupted")))
+    disp, last, error = None, "", None
+    setup_pat = r"Temp.is-[A-Z0-9]+\.tmp.setup\.tmp"
+    while proc.poll() is None:
+        time.sleep(10)
+        if not disp:
+            for p in pids(setup_pat):
+                disp = display_of(p)
+            continue
+        wins = windows(disp)
+        err = [w for w in wins if "ISDone" in w[1] or w[1] == "Error"]
+        if err:
+            screenshot(disp, err[0][0], logdir / "error.png")
+            error = f"installer showed an error dialog ({err[0][1]}); screenshot: {logdir / 'error.png'}"
+            stop()
+            break
+        # the bundled verifier (QuickSFV) blocks the installer until closed; we verify natively instead,
+        # and the DirectX / VC++ redist installers open wizards that wait for clicks; Proton doesn't need them
+        for p in pids(POSTINSTALL_PAT):
+            try:
+                what = Path(f"/proc/{p}/cmdline").read_bytes().split(b"\0")[0].decode(errors="replace")
+                os.kill(p, signal.SIGKILL)
+                say("closed post-install helper: " + re.split(r"[\\/]", what)[-1])
+            except (ProcessLookupError, FileNotFoundError):
+                pass
+        prog = next((w[1] for w in wins if re.match(r"^\d+(\.\d+)?%", w[1])), "")
+        if prog and prog.split()[0] != last:
+            last = prog.split()[0]
+            say(f"progress {prog}")
+    try:
+        proc.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        stop()
+    if error:
+        sys.exit(error)
+
+    # 3. verify
+    listfile = dest / "_Redist/fitgirl.md5"
+    if not listfile.is_file():
+        sys.exit(f"install did not complete: {listfile} missing (see {logdir})")
+    say("verifying installed files...")
+    ok, bad, _ = check_md5_list(listfile, listfile.parent, allow_missing=False)
+    if bad:
+        (logdir / "bad-files.txt").write_text("\n".join(bad))
+        sys.exit(f"{len(bad)} files failed verification, list in {logdir / 'bad-files.txt'}")
+    say(f"verified: {ok} files OK")
+
+    # 4. Lutris
+    if a.exe:
+        exe = dest / a.exe
+    else:
+        cands = [p for p in dest.rglob("*.exe") if not EXE_SKIP.search(str(p.relative_to(dest)))]
+        top = [p for p in cands if p.parent == dest] or cands
+        exe = max(top, key=lambda p: p.stat().st_size) if top else None
+    if not exe or not exe.is_file():
+        sys.exit("installed, but could not find the game executable; rerun Lutris step with --exe")
+    say(f"game executable: {exe}")
+    if a.no_lutris:
+        return
+    import yaml
+    ts = int(time.time())
+    cfg = f"{slug}-{ts}"
+    with sqlite3.connect(LUTRIS / "pga.db") as c:
+        if c.execute("select 1 from games where slug=?", (slug,)).fetchone():
+            say(f"Lutris already has an entry for '{slug}', left unchanged")
+            return
+        (LUTRIS / "games" / f"{cfg}.yml").write_text(yaml.safe_dump(
+            {"game": {"exe": str(exe), "prefix": str(prefix), "working_dir": str(exe.parent)}}, sort_keys=False))
+        c.execute("insert into games(name,sortname,slug,platform,runner,directory,installed,installed_at,"
+                  "configpath,has_custom_banner,has_custom_icon,has_custom_coverart_big,playtime) "
+                  "values(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (name, "", slug, "Windows", "wine", "", 1, ts, cfg, 0, 0, 0, 0))
+    say(f"added to Lutris as '{name}' (restart Lutris if it is open)")
+
+
+if __name__ == "__main__":
+    main()
